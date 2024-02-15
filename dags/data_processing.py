@@ -1,19 +1,15 @@
 from datetime import datetime, timedelta
-# import os
-# os.environ['AIRFLOW_HOME'] = '/airflow_config'
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.utils.email import send_email
 import requests
 import psycopg2
-import pandas as pd
-
 
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2024, 2, 12),
+    'start_date': datetime(2024, 2, 13),
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 1,
@@ -27,7 +23,31 @@ dag = DAG(
     schedule_interval='0 0 * * *', # Cron expression for midnight every day
 )
 
-def fetch_and_store_weather_forecast():
+def connection():
+    conn = psycopg2.connect(host="host.docker.internal",
+                            database="postgres",
+                            user="postgres",
+                            password="123")
+    return conn
+
+def fetch_weather_date():
+    cur = connection().cursor()
+    cur.execute("SELECT DATE FROM WEATHER_FORECAST ORDER BY DATE DESC LIMIT 1")
+    last_date = cur.fetchall()
+    current_date = datetime.now().date()
+    end_date = current_date + timedelta(days=1)
+    try:
+        last_date = last_date[0][0]  # Extract the date from the first tuple in the list
+        last_date = last_date.date()
+
+        while last_date <= current_date:
+            last_date += timedelta(days=1)
+            fetch_and_store_weather_forecast(last_date)
+    except:
+        fetch_and_store_weather_forecast(current_date)
+        fetch_and_store_weather_forecast(end_date)
+
+def fetch_and_store_weather_forecast(cur_date):
     endpoint = "https://api.openweathermap.org/data/2.5/forecast"
     params = {
         "q": 'Jakarta',
@@ -39,65 +59,43 @@ def fetch_and_store_weather_forecast():
     data = response.json()
     
     hourly_forecast = data['list']
-
-    # Transform data and store in PostgreSQL
+    # call connection
     conn = psycopg2.connect(host="host.docker.internal",
-                            database="postgres",
-                            user="postgres",
-                            password="123")
-    cur = conn.cursor()
+                        database="postgres",
+                        user="postgres",
+                        password="123")
+    cur = conn.cursor() 
+
     for forecast in hourly_forecast:
-        if datetime.fromtimestamp(forecast["dt"]).date() == datetime.now().date():
+        if datetime.fromtimestamp(forecast["dt"]).date() == cur_date:
             forecast_time = datetime.fromtimestamp(forecast["dt"]).strftime("%Y-%m-%d %H:%M:%S")
             wind = forecast["wind"]["speed"]
             temperature = forecast["main"]["temp"]
             humidity = forecast["main"]["humidity"]
             description = forecast["weather"][0]["description"]
             insert_dt = datetime.now().date()
-            cur.execute("INSERT INTO weather_forecast (date, wind, temperature, humidity, forecast, insert_dt) VALUES (%s, %s, %s, %s, %s, %s)",
-                        (forecast_time, wind, temperature, humidity, description, insert_dt))
+            # cur.execute("INSERT INTO weather_forecast (date, wind, temperature, humidity, forecast, insert_dt) VALUES (%s, %s, %s, %s, %s, %s)",
+            #             (forecast_time, wind, temperature, humidity, description, insert_dt))
+            cur.execute("""
+                            MERGE INTO weather_forecast AS target
+                            USING (VALUES (%s, %s, %s, %s, %s, %s)) AS source (date, wind, temperature, humidity, forecast, insert_dt)
+                            ON target.date = CAST(%s AS TIMESTAMP)
+                            WHEN MATCHED THEN
+                                UPDATE SET wind = source.wind, temperature = source.temperature, humidity = source.humidity, forecast = source.forecast, insert_dt = source.insert_dt
+                            WHEN NOT MATCHED THEN
+                                INSERT (date, wind, temperature, humidity, forecast, insert_dt)
+                                VALUES (CAST(%s AS TIMESTAMP), source.wind, source.temperature, source.humidity, source.forecast, source.insert_dt)
+                        """,
+                        (forecast_time, wind, temperature, humidity, description, insert_dt, forecast_time, forecast_time))
+
     conn.commit()
-    # cur.execute("SELECT date, wind, temperature, humidity, forecast,  FROM weather_forecast")
-    # weather_data = cur.fetchall()
     cur.close()
     conn.close()
-    # return weather_data
-
-# def format_report(weather_data):
-#     # Jinja templating to format the report dynamically
-#     template = """
-#     Weather Forecast Report:
-#     {% for data in weather_data %}
-#     Date: {{ data[0] }}, Wind: {{ data[1] }}, Temperature: {{ data[2] }}, Humidity: {{ data[3] }}, Forecast: {{ data[4] }}
-#     {% endfor %}
-#     """
-#     formatted_report = template.render(weather_data=weather_data)
-#     return formatted_report
-
-# def send_email_report(formatted_report):
-#     subject = "Weather Forecast Report"
-#     recipients = ["danangwahyu0607@gmail.com"]
-#     send_email(recipients, subject, formatted_report)
-
+    
 fetch_weather_task = PythonOperator(
     task_id='fetch_weather',
-    python_callable=fetch_and_store_weather_forecast,
+    python_callable=fetch_weather_date,
     dag=dag,
 )
-# format_report_task = PythonOperator(
-#     task_id='format_report',
-#     python_callable=format_report,
-#     provide_context=True,
-#     dag=dag,
-# )
-
-# send_email_task = PythonOperator(
-#     task_id='send_email_report',
-#     python_callable=send_email_report,
-#     provide_context=True,
-#     dag=dag,
-# )
-
-# fetch_weather_task >> format_report_task >> send_email_task
 
 dag
